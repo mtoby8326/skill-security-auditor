@@ -71,10 +71,37 @@ Context-aware scanning, finding deduplication, false positive fixes, new detecti
   - Dimension scorers register to a `ScorerRegistry`
   - Third-party custom dimensions via `entry_points` or drop-in `.py` files
   - Hook system: `pre_scan`, `post_score`, `pre_report`
-- **Configurable security policy**:
-  - `audit_policy.json`: weights, thresholds, enabled/disabled checks
-  - Organization-level policy templates
-  - `--policy <path>` CLI flag
+- **Configurable security policy (composable JSON policy files)**:
+  - `--policy <path>` CLI flag loads a policy JSON file
+  - Policy schema:
+    ```json
+    {
+      "policy_name": "enterprise-prod",
+      "score_gate": {
+        "min_total": 60,
+        "min_per_dimension": {
+          "code_execution": 10,
+          "data_handling": 8
+        }
+      },
+      "hard_blocks": [
+        "finding:critical:code_execution",
+        "finding:critical:data_handling"
+      ],
+      "require": {
+        "provenance": true,
+        "allowed_tools_declared": true,
+        "description_min_length": 20
+      }
+    }
+    ```
+  - **Three-layer gate** (all must pass):
+    1. `score_gate.min_total` — overall score threshold
+    2. `score_gate.min_per_dimension` — per-dimension minimum scores
+    3. `hard_blocks` — critical findings block regardless of total score
+  - **Requirement severity levels**: each `require` entry supports `warn` or `block`
+  - Built-in presets: `personal` (min_total: 40), `enterprise` (min_total: 60 + provenance + tool declaration)
+  - Organization-level policy templates composable via `"extends": "base-policy.json"`
 - **Historical comparison**:
   - `--diff <previous_result.json>` mode
   - Shows improved/degraded dimensions, new/resolved findings
