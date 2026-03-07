@@ -22,7 +22,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # Dimension weights (must sum to 100)
 WEIGHTS = {
@@ -57,36 +57,55 @@ EXEC_EVAL = re.compile(r'\b(eval|exec)\s*\(', re.IGNORECASE)
 EXEC_SUBPROCESS = re.compile(
     r'\b(subprocess\.|os\.system|os\.popen|Popen|shell=True'
     r'|child_process|spawn|execSync)\b')
-EXEC_DYNAMIC = re.compile(r'\b(__import__|importlib\.import_module|compile\()\b')
+EXEC_DYNAMIC = re.compile(
+    r'\b(__import__|importlib\.import_module)\b'
+    r'|(?<!re\.)\bcompile\s*\(')
 
-# File destruction
+# File destruction — require qualified names for unlink/rmdir
 FILE_DESTROY = re.compile(
-    r'\b(shutil\.rmtree|os\.remove|os\.unlink|rmdir|unlink)\b'
+    r'\b(shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir'
+    r'|Path\([^)]*\)\.unlink|Path\([^)]*\)\.rmdir)\b'
     r'|rm\s+(-rf?|--force)'
     r'|del\s+/[fqs]'
     r'|Remove-Item\s.*-Recurse', re.IGNORECASE)
 
-# Privilege escalation
+# Privilege escalation — tighten net user/localgroup to command context
 PRIV_ESC = re.compile(
-    r'\bsudo\s|runas\s|chmod\s+[0-7]*7[0-7]*|chmod\s+777'
-    r'|net\s+user\s|net\s+localgroup', re.IGNORECASE)
+    r'\bsudo\s|\brunas\s|\bchmod\s+[0-7]*7[0-7]*|\bchmod\s+777'
+    r'|(?:^|;|&&|\|)\s*net\s+user\s'
+    r'|(?:^|;|&&|\|)\s*net\s+localgroup', re.IGNORECASE | re.MULTILINE)
 
-# Credential patterns
+# Credential patterns — require compound form (prefix + KEY/TOKEN/SECRET)
 CRED_PATTERN = re.compile(
-    r'\b(API[_\-]?KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|PRIVATE[_\-]?KEY'
-    r'|ACCESS[_\-]?KEY|AUTH[_\-]?TOKEN|BEARER)\b', re.IGNORECASE)
+    r'\b(API[_\-]?KEY|ACCESS[_\-]?KEY|PRIVATE[_\-]?KEY'
+    r'|AUTH[_\-]?TOKEN|API[_\-]?TOKEN|API[_\-]?SECRET'
+    r'|[A-Z_]+_TOKEN|[A-Z_]+_SECRET|[A-Z_]+_PASSWORD'
+    r'|PASSPHRASE|BEARER)\b', re.IGNORECASE)
 CRED_HARDCODE = re.compile(
     r'''(?:api[_-]?key|token|secret|password)\s*[:=]\s*['"][^'"]{8,}['"]''',
     re.IGNORECASE)
 
 # Data exfiltration risk: reading files then sending to network
 FILE_READ = re.compile(
-    r'\b(open\(|read_text\b|read_bytes\b|readlines\b|Path\(.*\)\.read)')
+    r'\b(open\(|read_text\b|read_bytes\b|readlines\b|Path\([^)]*\)\.read)')
 
 # Obfuscation signals
 OBFUSCATION = re.compile(
     r'\b(base64\.b64decode|codecs\.decode|zlib\.decompress'
     r'|marshal\.loads|pickle\.loads)\b')
+
+# --- v0.2.0 new patterns ---
+# Path traversal
+PATH_TRAVERSAL = re.compile(r'\.\.[\\/]')
+
+# Unsafe deserialization
+UNSAFE_YAML = re.compile(r'\byaml\.load\s*\(')
+SAFE_YAML = re.compile(r'\byaml\.safe_load\b|Loader\s*=')
+
+# Command injection template: f-string / .format() near subprocess patterns
+CMD_INJECTION = re.compile(
+    r'(?:subprocess\.\w+|os\.system|os\.popen|Popen)\s*\(\s*f["\']'
+    r'|(?:subprocess\.\w+|os\.system|os\.popen|Popen)\s*\([^)]*\.format\s*\(')
 
 
 # ---------------------------------------------------------------------------
@@ -219,15 +238,169 @@ SEVERITY_DEDUCT = {
 }
 
 
-def _find_in_content(pattern, files, dimension, severity, message_tpl):
-    """Search pattern across files, return findings."""
+# Context severity downgrade map: (original_severity, context) -> new_severity
+_CONTEXT_DOWNGRADE = {
+    ('critical', 'doc'):     'low',
+    ('critical', 'comment'): 'low',
+    ('high',     'doc'):     'info',
+    ('high',     'comment'): 'info',
+    ('medium',   'doc'):     'info',
+    ('medium',   'comment'): 'info',
+    ('low',      'doc'):     'info',
+    ('low',      'comment'): 'info',
+}
+
+
+def classify_lines(filepath, content):
+    """Classify each line as 'code', 'comment', or 'doc'.
+
+    Returns dict mapping line_number -> context_type.
+    """
+    lines = content.split('\n')
+    result = {}
+
+    # SKILL.md: body after frontmatter is documentation
+    if filepath.endswith('SKILL.md'):
+        fm_count = 0
+        for i, line in enumerate(lines, 1):
+            if line.strip() == '---':
+                fm_count += 1
+            if fm_count < 2:
+                result[i] = 'meta'
+            elif line.strip() == '---' and fm_count == 2:
+                result[i] = 'meta'
+            else:
+                result[i] = 'doc'
+        return result
+
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # Python: # comments and triple-quoted docstrings
+    if ext == '.py':
+        in_docstring = False
+        ds_char = None
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if in_docstring:
+                result[i] = 'comment'
+                if ds_char in stripped:
+                    in_docstring = False
+                continue
+            if stripped.startswith('"""') or stripped.startswith("'''"):
+                char = stripped[:3]
+                if stripped.count(char) >= 2 and len(stripped) > 3:
+                    result[i] = 'comment'  # single-line docstring
+                else:
+                    in_docstring = True
+                    ds_char = char
+                    result[i] = 'comment'
+                continue
+            if stripped.startswith('#'):
+                result[i] = 'comment'
+            else:
+                result[i] = 'code'
+        return result
+
+    # JS / TS: // and /* */
+    if ext in ('.js', '.ts'):
+        in_block = False
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if in_block:
+                result[i] = 'comment'
+                if '*/' in stripped:
+                    in_block = False
+                continue
+            if stripped.startswith('/*'):
+                in_block = True
+                if '*/' in stripped:
+                    in_block = False
+                result[i] = 'comment'
+                continue
+            if stripped.startswith('//'):
+                result[i] = 'comment'
+            else:
+                result[i] = 'code'
+        return result
+
+    # Shell / PowerShell: # comments
+    if ext in ('.sh', '.bash', '.ps1'):
+        for i, line in enumerate(lines, 1):
+            if line.strip().startswith('#'):
+                result[i] = 'comment'
+            else:
+                result[i] = 'code'
+        return result
+
+    # Markdown (.md but not SKILL.md): treat as doc
+    if ext == '.md':
+        for i in range(1, len(lines) + 1):
+            result[i] = 'doc'
+        return result
+
+    # Default: all code
+    for i in range(1, len(lines) + 1):
+        result[i] = 'code'
+    return result
+
+
+def _find_in_content(pattern, files, dimension, severity, message_tpl,
+                     context_maps=None):
+    """Search pattern across files, return findings.
+
+    If context_maps is provided (dict[filepath -> context_map]),
+    severity is downgraded for matches in comments/docs.
+    """
     findings = []
     for fpath, content in files:
+        ctx_map = context_maps.get(fpath, {}) if context_maps else {}
         for i, line_text in enumerate(content.split('\n'), 1):
             for m in pattern.finditer(line_text):
-                msg = message_tpl.format(match=m.group())
-                findings.append(Finding(dimension, severity, msg, fpath, i))
+                actual_sev = severity
+                ctx = ctx_map.get(i, 'code')
+                suffix = ''
+
+                if ctx != 'code':
+                    actual_sev = _CONTEXT_DOWNGRADE.get(
+                        (severity, ctx), severity)
+                    suffix = f' [in {ctx}]'
+
+                msg = message_tpl.format(match=m.group()) + suffix
+                findings.append(Finding(
+                    dimension, actual_sev, msg, fpath, i))
     return findings
+
+
+def _deduplicate_findings(findings):
+    """Merge duplicate findings: same dimension + base message + file.
+
+    Returns deduplicated list. Merged entries get '(xN)' suffix.
+    """
+    import re as _re
+    groups = {}
+    for f in findings:
+        # Strip line-specific info and context suffix for grouping
+        base_msg = _re.sub(r'\s*\[in (?:doc|comment|meta)\]$', '', f.message)
+        base_msg = _re.sub(r': .+$', '', base_msg)  # normalize match detail
+        key = (f.dimension, f.severity, base_msg, f.file)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(f)
+
+    result = []
+    for key, group in groups.items():
+        rep = group[0]
+        if len(group) > 1:
+            # Keep representative, add count
+            new_msg = rep.message
+            # Remove existing match detail for cleaner aggregation
+            new_msg = _re.sub(r'\s*\[in (?:doc|comment|meta)\]$', '', new_msg)
+            new_msg += f' (x{len(group)})'
+            result.append(Finding(
+                rep.dimension, rep.severity, new_msg, rep.file, rep.line))
+        else:
+            result.append(rep)
+    return result
 
 
 def score_permission_scope(fm, metadata, files):
@@ -300,55 +473,73 @@ def score_permission_scope(fm, metadata, files):
     return round(score * max_score, 1), findings
 
 
-def score_network_exposure(fm, metadata, files):
+def score_network_exposure(fm, metadata, files, context_maps=None):
     """D2: Network Exposure — external URLs, API calls, network libraries."""
     findings = []
     max_score = WEIGHTS['network_exposure']
 
     urls = set()
+    url_in_code = set()  # only count URLs from code context for scoring
     net_cmds = []
     net_libs = []
 
     for fpath, content in files:
-        for m in NET_URL.finditer(content):
-            url = m.group()
-            # Ignore common safe URLs
-            if any(safe in url.lower() for safe in
-                   ['localhost', '127.0.0.1', 'example.com', '::1']):
-                continue
-            urls.add(url[:80])
+        ctx_map = context_maps.get(fpath, {}) if context_maps else {}
+        for i, line_text in enumerate(content.split('\n'), 1):
+            ctx = ctx_map.get(i, 'code')
+            for m in NET_URL.finditer(line_text):
+                url = m.group()
+                if any(safe in url.lower() for safe in
+                       ['localhost', '127.0.0.1', 'example.com', '::1']):
+                    continue
+                urls.add(url[:80])
+                if ctx == 'code':
+                    url_in_code.add(url[:80])
 
         net_cmds.extend(
             _find_in_content(NET_CMD, [(fpath, content)],
                              'network_exposure', 'medium',
-                             'Network command: {match}'))
+                             'Network command: {match}',
+                             context_maps))
         net_libs.extend(
             _find_in_content(NET_LIB, [(fpath, content)],
                              'network_exposure', 'medium',
-                             'Network library usage: {match}'))
+                             'Network library usage: {match}',
+                             context_maps))
 
-    findings.extend(net_cmds)
-    findings.extend(net_libs)
+    findings.extend(_deduplicate_findings(net_cmds))
+    findings.extend(_deduplicate_findings(net_libs))
 
-    # Extract unique domains
-    domains = set()
+    # Extract unique domains — only from code context for scoring
+    code_domains = set()
+    all_domains = set()
     for url in urls:
         try:
             host = url.split('//')[1].split('/')[0].split(':')[0]
-            domains.add(host)
+            all_domains.add(host)
+        except IndexError:
+            pass
+    for url in url_in_code:
+        try:
+            host = url.split('//')[1].split('/')[0].split(':')[0]
+            code_domains.add(host)
         except IndexError:
             pass
 
-    if domains:
+    if all_domains:
         findings.append(Finding(
-            'network_exposure', 'medium' if len(domains) <= 2 else 'high',
-            f'External domains contacted ({len(domains)}): '
-            f'{", ".join(sorted(list(domains)[:5]))}'))
+            'network_exposure',
+            'medium' if len(code_domains) <= 2 else 'high',
+            f'External domains contacted ({len(all_domains)}): '
+            f'{", ".join(sorted(list(all_domains)[:5]))}'))
 
+    # Score based on code-context findings only
+    code_cmds = [f for f in net_cmds if '[in' not in f.message]
+    code_libs = [f for f in net_libs if '[in' not in f.message]
     deduct = 0.0
-    deduct += min(0.3, len(domains) * 0.1)
-    deduct += min(0.3, len(net_cmds) * 0.05)
-    deduct += min(0.3, len(net_libs) * 0.08)
+    deduct += min(0.3, len(code_domains) * 0.1)
+    deduct += min(0.3, len(code_cmds) * 0.05)
+    deduct += min(0.3, len(code_libs) * 0.08)
 
     if not urls and not net_cmds and not net_libs:
         findings.append(Finding(
@@ -359,32 +550,67 @@ def score_network_exposure(fm, metadata, files):
     return round(score * max_score, 1), findings
 
 
-def score_code_execution(fm, metadata, files):
+def score_code_execution(fm, metadata, files, context_maps=None):
     """D3: Code Execution Risk — dangerous functions, file ops, privilege escalation."""
     findings = []
     max_score = WEIGHTS['code_execution']
 
     evals = _find_in_content(EXEC_EVAL, files,
                              'code_execution', 'critical',
-                             'Dynamic code execution: {match}')
+                             'Dynamic code execution: {match}',
+                             context_maps)
     subprocs = _find_in_content(EXEC_SUBPROCESS, files,
                                 'code_execution', 'high',
-                                'Subprocess / system call: {match}')
+                                'Subprocess / system call: {match}',
+                                context_maps)
     dynamics = _find_in_content(EXEC_DYNAMIC, files,
                                 'code_execution', 'high',
-                                'Dynamic import: {match}')
+                                'Dynamic import: {match}',
+                                context_maps)
     destroys = _find_in_content(FILE_DESTROY, files,
                                 'code_execution', 'high',
-                                'File destruction operation: {match}')
+                                'File destruction operation: {match}',
+                                context_maps)
     privs = _find_in_content(PRIV_ESC, files,
                              'code_execution', 'critical',
-                             'Privilege escalation: {match}')
+                             'Privilege escalation: {match}',
+                             context_maps)
     obfs = _find_in_content(OBFUSCATION, files,
                             'code_execution', 'high',
-                            'Obfuscation / decode pattern: {match}')
+                            'Obfuscation / decode pattern: {match}',
+                            context_maps)
 
-    all_findings = evals + subprocs + dynamics + destroys + privs + obfs
-    findings.extend(all_findings)
+    # v0.2.0: new patterns
+    # Path traversal
+    traversals = _find_in_content(PATH_TRAVERSAL, files,
+                                  'code_execution', 'medium',
+                                  'Path traversal pattern: {match}',
+                                  context_maps)
+    # Unsafe yaml deserialization
+    unsafe_yaml = []
+    for fpath, content in files:
+        ctx_map = context_maps.get(fpath, {}) if context_maps else {}
+        for i, line_text in enumerate(content.split('\n'), 1):
+            if UNSAFE_YAML.search(line_text) and not SAFE_YAML.search(line_text):
+                ctx = ctx_map.get(i, 'code')
+                sev = 'high'
+                suffix = ''
+                if ctx != 'code':
+                    sev = _CONTEXT_DOWNGRADE.get(('high', ctx), 'high')
+                    suffix = f' [in {ctx}]'
+                unsafe_yaml.append(Finding(
+                    'code_execution', sev,
+                    f'Unsafe YAML deserialization: yaml.load() without SafeLoader{suffix}',
+                    fpath, i))
+    # Command injection
+    cmd_injects = _find_in_content(CMD_INJECTION, files,
+                                   'code_execution', 'high',
+                                   'Command injection risk: {match}',
+                                   context_maps)
+
+    all_findings = (evals + subprocs + dynamics + destroys + privs + obfs
+                    + traversals + unsafe_yaml + cmd_injects)
+    findings.extend(_deduplicate_findings(all_findings))
 
     if not all_findings:
         findings.append(Finding(
@@ -398,20 +624,22 @@ def score_code_execution(fm, metadata, files):
     return round(score * max_score, 1), findings
 
 
-def score_data_handling(fm, metadata, files):
+def score_data_handling(fm, metadata, files, context_maps=None):
     """D4: Data Handling — credentials, hardcoded secrets, exfiltration risk."""
     findings = []
     max_score = WEIGHTS['data_handling']
 
     cred_refs = _find_in_content(CRED_PATTERN, files,
                                  'data_handling', 'low',
-                                 'Credential reference: {match}')
+                                 'Credential reference: {match}',
+                                 context_maps)
     hardcodes = _find_in_content(CRED_HARDCODE, files,
                                  'data_handling', 'critical',
-                                 'Possible hardcoded credential: {match}')
+                                 'Possible hardcoded credential: {match}',
+                                 context_maps)
 
-    findings.extend(cred_refs)
-    findings.extend(hardcodes)
+    findings.extend(_deduplicate_findings(cred_refs))
+    findings.extend(_deduplicate_findings(hardcodes))
 
     # Check env var requirements in metadata (this is good practice)
     req_env = metadata.get('requires', {})
@@ -593,11 +821,16 @@ def audit_skill(skill_path):
     # Scan all files
     files = scan_files(skill_path)
 
+    # v0.2.0: build context maps for context-aware scanning
+    context_maps = {}
+    for fpath, content in files:
+        context_maps[fpath] = classify_lines(fpath, content)
+
     # Run 6 dimension scorers
     d1_score, d1_findings = score_permission_scope(fm, metadata, files)
-    d2_score, d2_findings = score_network_exposure(fm, metadata, files)
-    d3_score, d3_findings = score_code_execution(fm, metadata, files)
-    d4_score, d4_findings = score_data_handling(fm, metadata, files)
+    d2_score, d2_findings = score_network_exposure(fm, metadata, files, context_maps)
+    d3_score, d3_findings = score_code_execution(fm, metadata, files, context_maps)
+    d4_score, d4_findings = score_data_handling(fm, metadata, files, context_maps)
     d5_score, d5_findings = score_supply_chain(fm, metadata, skill_path)
     d6_score, d6_findings = score_transparency(fm, metadata, files)
 

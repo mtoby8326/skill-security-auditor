@@ -319,13 +319,16 @@ class TestDataHandling(TempSkillMixin, unittest.TestCase):
         self.assertIn('env vars', msgs)
 
     def test_multiple_credential_types(self):
+        """Compound credential names should be detected (dedup may merge)."""
         files = [('cfg.py',
-                   'TOKEN = "abc"\n'
-                   'SECRET = os.getenv("SECRET")\n'
-                   'PASSWORD = input("pass: ")')]
+                   'AUTH_TOKEN = os.getenv("AUTH_TOKEN")\n'
+                   'API_SECRET = os.getenv("API_SECRET")\n'
+                   'DB_PASSWORD = input("pass: ")')]
         score, findings = auditor.score_data_handling({}, {}, files)
+        # After dedup, all cred refs in same file merge into 1 finding
         low_findings = [f for f in findings if f.severity == 'low']
-        self.assertGreaterEqual(len(low_findings), 2)
+        self.assertGreaterEqual(len(low_findings), 1)
+        self.assertLess(score, auditor.WEIGHTS['data_handling'])
 
 
 # =========================================================================
@@ -776,6 +779,260 @@ class TestEdgeCases(TempSkillMixin, unittest.TestCase):
 
     def test_weights_sum_to_100(self):
         self.assertEqual(sum(auditor.WEIGHTS.values()), 100)
+
+
+# =========================================================================
+# v0.2.0: Context Classification
+# =========================================================================
+class TestContextClassification(unittest.TestCase):
+    """Tests for classify_lines() context detection."""
+
+    def test_skill_md_body_is_doc(self):
+        content = '---\nname: test\n---\n# Usage\ncurl https://api.com'
+        ctx = auditor.classify_lines('SKILL.md', content)
+        # Lines after frontmatter should be 'doc'
+        self.assertEqual(ctx[4], 'doc')  # # Usage
+        self.assertEqual(ctx[5], 'doc')  # curl line
+
+    def test_skill_md_frontmatter_is_meta(self):
+        content = '---\nname: test\n---\nBody'
+        ctx = auditor.classify_lines('SKILL.md', content)
+        self.assertEqual(ctx[1], 'meta')  # ---
+        self.assertEqual(ctx[2], 'meta')  # name: test
+
+    def test_python_comments(self):
+        content = '# This is a comment\nx = eval(input())\n# Never use eval'
+        ctx = auditor.classify_lines('main.py', content)
+        self.assertEqual(ctx[1], 'comment')
+        self.assertEqual(ctx[2], 'code')
+        self.assertEqual(ctx[3], 'comment')
+
+    def test_python_docstring(self):
+        content = 'def foo():\n    """Do not use eval."""\n    return 1'
+        ctx = auditor.classify_lines('main.py', content)
+        self.assertEqual(ctx[2], 'comment')  # docstring
+        self.assertEqual(ctx[3], 'code')
+
+    def test_python_multiline_docstring(self):
+        content = 'def foo():\n    """\n    Never call eval().\n    """\n    return 1'
+        ctx = auditor.classify_lines('func.py', content)
+        self.assertEqual(ctx[2], 'comment')  # """
+        self.assertEqual(ctx[3], 'comment')  # Never call eval
+        self.assertEqual(ctx[4], 'comment')  # """
+        self.assertEqual(ctx[5], 'code')     # return 1
+
+    def test_js_comments(self):
+        content = '// This is a comment\nconst x = eval(y);\n/* block */'
+        ctx = auditor.classify_lines('main.js', content)
+        self.assertEqual(ctx[1], 'comment')
+        self.assertEqual(ctx[2], 'code')
+        self.assertEqual(ctx[3], 'comment')
+
+    def test_shell_comments(self):
+        content = '#!/bin/bash\n# Never use sudo\nsudo apt install pkg'
+        ctx = auditor.classify_lines('run.sh', content)
+        self.assertEqual(ctx[1], 'comment')  # shebang
+        self.assertEqual(ctx[2], 'comment')  # comment
+        self.assertEqual(ctx[3], 'code')     # sudo
+
+    def test_default_is_code(self):
+        content = 'some text\nmore text'
+        ctx = auditor.classify_lines('data.yaml', content)
+        self.assertEqual(ctx[1], 'code')
+
+    def test_non_skill_md_is_doc(self):
+        content = 'eval() is dangerous\nsubprocess.run'
+        ctx = auditor.classify_lines('README.md', content)
+        self.assertEqual(ctx[1], 'doc')
+        self.assertEqual(ctx[2], 'doc')
+
+
+# =========================================================================
+# v0.2.0: Context-Aware Severity Downgrade
+# =========================================================================
+class TestContextDowngrade(TempSkillMixin, unittest.TestCase):
+    """Tests for severity downgrade in non-code contexts."""
+
+    def test_eval_in_comment_downgraded(self):
+        """eval() in a Python comment should not be critical."""
+        files = [('main.py', '# Never use eval() in production\nx = 1')]
+        ctx_maps = {}
+        for fp, content in files:
+            ctx_maps[fp] = auditor.classify_lines(fp, content)
+        score, findings = auditor.score_code_execution({}, {}, files, ctx_maps)
+        crits = [f for f in findings if f.severity == 'critical']
+        self.assertEqual(len(crits), 0)  # downgraded, not critical
+
+    def test_eval_in_code_stays_critical(self):
+        """eval() in actual code remains critical."""
+        files = [('main.py', 'result = eval(user_input)')]
+        ctx_maps = {'main.py': auditor.classify_lines('main.py', files[0][1])}
+        score, findings = auditor.score_code_execution({}, {}, files, ctx_maps)
+        crits = [f for f in findings if f.severity == 'critical']
+        self.assertGreater(len(crits), 0)
+
+    def test_curl_in_skill_md_doc_downgraded(self):
+        """curl in SKILL.md body (documentation) should be info, not medium."""
+        files = [('SKILL.md',
+                   '---\nname: test\n---\n## Usage\ncurl https://api.com/data')]
+        ctx_maps = {}
+        for fp, content in files:
+            ctx_maps[fp] = auditor.classify_lines(fp, content)
+        score, findings = auditor.score_network_exposure({}, {}, files, ctx_maps)
+        # curl in doc should be downgraded to info
+        medium_cmds = [f for f in findings
+                       if f.severity == 'medium' and 'command' in f.message.lower()]
+        self.assertEqual(len(medium_cmds), 0)
+
+    def test_credential_in_doc_downgraded(self):
+        """API_KEY reference in SKILL.md docs should be info."""
+        files = [('SKILL.md',
+                   '---\nname: test\n---\n## Config\nSet your API_KEY in env.')]
+        ctx_maps = {'SKILL.md': auditor.classify_lines('SKILL.md', files[0][1])}
+        score, findings = auditor.score_data_handling({}, {}, files, ctx_maps)
+        low_creds = [f for f in findings
+                     if f.severity == 'low' and 'Credential' in f.message]
+        self.assertEqual(len(low_creds), 0)  # downgraded to info
+
+    def test_doc_penalty_paradox_resolved(self):
+        """v0.2.0: well-documented skill should NOT score lower."""
+        # Skill with lots of curl/Bearer docs but clean code
+        tmpdir = self.make_skill(
+            '---\n'
+            'name: api-skill\n'
+            'description: "A skill that documents API usage thoroughly"\n'
+            'allowed-tools: []\n'
+            'homepage: https://github.com/test/api\n'
+            '---\n'
+            '# API Skill\n\n'
+            '## Usage Examples\n'
+            'curl -H "Authorization: Bearer $TOKEN" https://api.com/data\n'
+            'curl -H "Authorization: Bearer $TOKEN" https://api.com/users\n'
+            'curl https://api.com/health\n\n'
+            '## Safety Rules\n'
+            'Never hardcode API keys.\n',
+            {
+                'scripts/main.py': 'def format_data(data):\n    return str(data)\n',
+                '.clawhub/origin.json': '{"slug": "api-skill"}',
+            })
+        result = auditor.audit_skill(tmpdir)
+        # Should score A despite documentation mentioning curl/Bearer
+        self.assertGreaterEqual(result['total_score'], 90)
+        self.assertEqual(result['grade'], 'A')
+
+
+# =========================================================================
+# v0.2.0: Finding Deduplication
+# =========================================================================
+class TestDeduplication(unittest.TestCase):
+    """Tests for _deduplicate_findings()."""
+
+    def test_merges_same_pattern_same_file(self):
+        findings = [
+            auditor.Finding('d', 'medium', 'Network command: curl', 'f.md', 1),
+            auditor.Finding('d', 'medium', 'Network command: curl', 'f.md', 5),
+            auditor.Finding('d', 'medium', 'Network command: curl', 'f.md', 10),
+        ]
+        result = auditor._deduplicate_findings(findings)
+        self.assertEqual(len(result), 1)
+        self.assertIn('x3', result[0].message)
+
+    def test_keeps_different_files_separate(self):
+        findings = [
+            auditor.Finding('d', 'low', 'Credential reference: API_KEY', 'a.py', 1),
+            auditor.Finding('d', 'low', 'Credential reference: API_KEY', 'b.py', 1),
+        ]
+        result = auditor._deduplicate_findings(findings)
+        self.assertEqual(len(result), 2)
+
+    def test_keeps_different_severity_separate(self):
+        findings = [
+            auditor.Finding('d', 'high', 'Something: x', 'f.py', 1),
+            auditor.Finding('d', 'info', 'Something: x [in doc]', 'f.py', 2),
+        ]
+        result = auditor._deduplicate_findings(findings)
+        self.assertEqual(len(result), 2)
+
+    def test_single_finding_unchanged(self):
+        findings = [auditor.Finding('d', 'low', 'One finding', 'f.py', 1)]
+        result = auditor._deduplicate_findings(findings)
+        self.assertEqual(len(result), 1)
+        self.assertNotIn('x', result[0].message)
+
+    def test_empty_list(self):
+        result = auditor._deduplicate_findings([])
+        self.assertEqual(len(result), 0)
+
+
+# =========================================================================
+# v0.2.0: New Detection Patterns
+# =========================================================================
+class TestNewPatterns(TempSkillMixin, unittest.TestCase):
+    """Tests for v0.2.0 new security patterns."""
+
+    def test_path_traversal_detected(self):
+        files = [('exploit.py', 'path = user_input + "/../../../etc/passwd"')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        msgs = ' '.join(f.message.lower() for f in findings)
+        self.assertIn('path traversal', msgs)
+
+    def test_unsafe_yaml_load(self):
+        files = [('config.py', 'data = yaml.load(raw_text)')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        msgs = ' '.join(f.message.lower() for f in findings)
+        self.assertIn('yaml', msgs)
+
+    def test_safe_yaml_load_ok(self):
+        """yaml.load with Loader= should NOT trigger."""
+        files = [('config.py', 'data = yaml.load(raw, Loader=yaml.SafeLoader)')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        msgs = ' '.join(f.message.lower() for f in findings
+                        if f.severity not in ('info',))
+        self.assertNotIn('yaml', msgs)
+
+    def test_yaml_safe_load_ok(self):
+        files = [('config.py', 'data = yaml.safe_load(raw)')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        msgs = ' '.join(f.message.lower() for f in findings
+                        if f.severity not in ('info',))
+        self.assertNotIn('unsafe', msgs)
+
+    def test_command_injection_fstring(self):
+        files = [('run.py', 'subprocess.run(f"cmd {user_input}")')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        msgs = ' '.join(f.message.lower() for f in findings)
+        self.assertIn('injection', msgs)
+
+    def test_re_compile_not_flagged(self):
+        """re.compile() should NOT be flagged as dynamic execution."""
+        files = [('parser.py', 'pattern = re.compile(r"\\d+")')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        # Should get full score — re.compile is safe
+        self.assertEqual(score, auditor.WEIGHTS['code_execution'])
+
+    def test_standalone_compile_still_flagged(self):
+        """compile() without re. prefix should still be flagged."""
+        files = [('evil.py', 'code = compile(source, "<string>", "exec")')]
+        score, findings = auditor.score_code_execution({}, {}, files)
+        self.assertLess(score, auditor.WEIGHTS['code_execution'])
+
+    def test_standalone_token_not_flagged(self):
+        """Standalone 'TOKEN' in docs should not trigger credential finding."""
+        files = [('SKILL.md',
+                   '---\nname: test\n---\nPass your token to the API.')]
+        ctx_maps = {'SKILL.md': auditor.classify_lines('SKILL.md', files[0][1])}
+        score, findings = auditor.score_data_handling({}, {}, files, ctx_maps)
+        cred_findings = [f for f in findings
+                         if f.severity in ('low', 'medium', 'high', 'critical')
+                         and 'Credential' in f.message]
+        self.assertEqual(len(cred_findings), 0)
+
+    def test_compound_token_still_detected(self):
+        """AUTH_TOKEN in code should still be detected."""
+        files = [('config.py', 'key = os.getenv("AUTH_TOKEN")')]
+        score, findings = auditor.score_data_handling({}, {}, files)
+        low_findings = [f for f in findings if f.severity == 'low']
+        self.assertGreater(len(low_findings), 0)
 
 
 if __name__ == '__main__':
