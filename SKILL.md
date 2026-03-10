@@ -1,9 +1,9 @@
 ---
 name: skill-security-auditor
 description: "Analyze and score the security of OpenClaw skills across 6 dimensions (permission scope, network exposure, code execution risk, data handling, supply chain trust, transparency). Produces a 0-100 score with A/B/C/D/F grade, detailed findings, and actionable recommendations. Use when you want to evaluate whether a skill is safe to install or how to improve your own skill's security posture."
-version: 0.1.0
 homepage: https://github.com/mtoby8326/skill-security-auditor
 allowed-tools: []
+metadata: {"clawdbot":{"emoji":"🔒"}}
 ---
 
 # Skill Security Auditor
@@ -26,6 +26,16 @@ python scripts/audit_skill.py --scan-dir <skills_directory>
 ```
 python scripts/audit_skill.py <skill_path> --json
 python scripts/audit_skill.py --scan-dir <dir> --json
+```
+
+### Package skill (exclude tests by default)
+```
+python scripts/package_skill.py .
+```
+Default excludes: `tests`, `.git`, `dist`, `__pycache__`, `.pytest_cache`.
+### Package skill with custom exclusions
+```
+python scripts/package_skill.py . --exclude tests --exclude "*.log" --output-dir dist
 ```
 
 ## Scoring Dimensions
